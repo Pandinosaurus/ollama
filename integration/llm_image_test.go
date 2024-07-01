@@ -5,11 +5,10 @@ package integration
 import (
 	"context"
 	"encoding/base64"
-	"net/http"
 	"testing"
 	"time"
 
-	"github.com/jmorganca/ollama/api"
+	"github.com/ollama/ollama/api"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,10 +28,15 @@ func TestIntegrationMultimodal(t *testing.T) {
 		},
 	}
 
-	resp := "the ollamas"
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
+	// Note: sometimes it returns "the ollamas" sometimes "the ollams"
+	resp := "the ollam"
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	GenerateTestHelper(ctx, t, &http.Client{}, req, []string{resp})
+	client, _, cleanup := InitServerConnection(ctx, t)
+	defer cleanup()
+	require.NoError(t, PullIfMissing(ctx, client, req.Model))
+	// llava models on CPU can be quite slow to start,
+	DoGenerate(ctx, t, client, req, []string{resp}, 120*time.Second, 30*time.Second)
 }
 
 const imageEncoding = `iVBORw0KGgoAAAANSUhEUgAAANIAAAB4CAYAAACHHqzKAAAAAXNSR0IArs4c6QAAAIRlWElmTU0AKgAAAAgABQESAAMAAAABAAEAAAEaAAUAAAABAAAASgEb

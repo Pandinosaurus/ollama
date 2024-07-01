@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/jmorganca/ollama/api"
+	"github.com/ollama/ollama/api"
 )
 
 type Error struct {
@@ -109,13 +109,12 @@ func toChatCompletion(id string, r api.ChatResponse) ChatCompletion {
 		Choices: []Choice{{
 			Index:   0,
 			Message: Message{Role: r.Message.Role, Content: r.Message.Content},
-			FinishReason: func(done bool) *string {
-				if done {
-					reason := "stop"
+			FinishReason: func(reason string) *string {
+				if len(reason) > 0 {
 					return &reason
 				}
 				return nil
-			}(r.Done),
+			}(r.DoneReason),
 		}},
 		Usage: Usage{
 			// TODO: ollama returns 0 for prompt eval if the prompt was cached, but openai returns the actual count
@@ -133,19 +132,16 @@ func toChunk(id string, r api.ChatResponse) ChatCompletionChunk {
 		Created:           time.Now().Unix(),
 		Model:             r.Model,
 		SystemFingerprint: "fp_ollama",
-		Choices: []ChunkChoice{
-			{
-				Index: 0,
-				Delta: Message{Role: "assistant", Content: r.Message.Content},
-				FinishReason: func(done bool) *string {
-					if done {
-						reason := "stop"
-						return &reason
-					}
-					return nil
-				}(r.Done),
-			},
-		},
+		Choices: []ChunkChoice{{
+			Index: 0,
+			Delta: Message{Role: "assistant", Content: r.Message.Content},
+			FinishReason: func(reason string) *string {
+				if len(reason) > 0 {
+					return &reason
+				}
+				return nil
+			}(r.DoneReason),
+		}},
 	}
 }
 
@@ -182,9 +178,6 @@ func fromRequest(r ChatCompletionRequest) api.ChatRequest {
 
 	if r.Seed != nil {
 		options["seed"] = *r.Seed
-
-		// temperature=0 is required for reproducible outputs
-		options["temperature"] = 0.0
 	}
 
 	if r.FrequencyPenalty != nil {
@@ -249,7 +242,6 @@ func (w *writer) writeResponse(data []byte) (int, error) {
 		d, err := json.Marshal(toChunk(w.id, chatResponse))
 		if err != nil {
 			return 0, err
-
 		}
 
 		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")

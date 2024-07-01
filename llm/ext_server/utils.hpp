@@ -1,3 +1,25 @@
+// MIT License
+
+// Copyright (c) 2023 Georgi Gerganov
+
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 #pragma once
 
 #include <string>
@@ -33,9 +55,10 @@ extern bool server_log_json;
     } while (0)
 #endif
 
-#define LOG_ERROR(  MSG, ...) server_log("ERR",  __func__, __LINE__, MSG, __VA_ARGS__)
+#define LOG_ERROR(  MSG, ...) server_log("ERROR",  __func__, __LINE__, MSG, __VA_ARGS__)
 #define LOG_WARNING(MSG, ...) server_log("WARN", __func__, __LINE__, MSG, __VA_ARGS__)
 #define LOG_INFO(   MSG, ...) server_log("INFO", __func__, __LINE__, MSG, __VA_ARGS__)
+#define LOG_DEBUG(  MSG, ...) server_log("DEBUG", __func__, __LINE__, MSG, __VA_ARGS__)
 
 enum server_state {
     SERVER_STATE_LOADING_MODEL,  // Server is starting up, model not fully loaded yet
@@ -101,6 +124,10 @@ static inline void server_log(const char *level, const char *function, int line,
         {"timestamp", time(nullptr)},
     };
 
+    if (strncmp("DEBUG", level, strlen(level)) == 0 && !server_verbose) {
+        return;
+    }
+
     if (server_log_json) {
         log.merge_patch(
                 {
@@ -115,14 +142,12 @@ static inline void server_log(const char *level, const char *function, int line,
 
         std::cout << log.dump(-1, ' ', false, json::error_handler_t::replace) << "\n" << std::flush;
     } else {
-        char buf[1024];
-        snprintf(buf, 1024, "%4s [%24s] %s", level, function, message);
-
         if (!extra.empty()) {
             log.merge_patch(extra);
         }
+
         std::stringstream ss;
-        ss << buf << " |";
+        ss << level << " [" << function << "] " << message << " |";
         for (const auto& el : log.items())
         {
             const std::string value = el.value().dump(-1, ' ', false, json::error_handler_t::replace);
