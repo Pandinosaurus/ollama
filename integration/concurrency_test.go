@@ -20,9 +20,9 @@ import (
 )
 
 // Send multiple requests in parallel (concurrently) to a single model and ensure responses are expected
-func TestConcurrentGenerate(t *testing.T) {
+func runConcurrentChat(t *testing.T) {
 	// Assumes all requests have the same model
-	req, resp := GenerateRequests()
+	req, resp := ChatRequests()
 	numParallel := int(envconfig.NumParallel() + 1)
 	iterLimit := 3
 
@@ -31,16 +31,10 @@ func TestConcurrentGenerate(t *testing.T) {
 	defer cancel()
 	client, _, cleanup := InitServerConnection(ctx, t)
 	defer cleanup()
+	pullOrSkip(ctx, t, client, req[0].Model)
 
 	// Get the server running (if applicable) warm the model up with a single initial request
-	slog.Info("loading", "model", req[0].Model)
-	err := client.Generate(ctx,
-		&api.GenerateRequest{Model: req[0].Model, KeepAlive: &api.Duration{Duration: 10 * time.Second}},
-		func(response api.GenerateResponse) error { return nil },
-	)
-	if err != nil {
-		t.Fatalf("failed to load model %s: %s", req[0].Model, err)
-	}
+	preloadGenerateModel(ctx, t, client, api.GenerateRequest{Model: req[0].Model, KeepAlive: &api.Duration{Duration: 10 * time.Second}})
 
 	var wg sync.WaitGroup
 	r := rand.New(rand.NewSource(0))
@@ -57,7 +51,7 @@ func TestConcurrentGenerate(t *testing.T) {
 				slog.Info("Starting", "thread", i, "iter", j)
 				// On slower GPUs it can take a while to process the concurrent requests
 				// so we allow a much longer initial timeout
-				DoGenerate(ctx, t, client, req[k], resp[k], 120*time.Second, 20*time.Second)
+				DoChat(ctx, t, client, req[k], resp[k], 120*time.Second, 20*time.Second)
 			}
 		}(i)
 	}
@@ -66,7 +60,10 @@ func TestConcurrentGenerate(t *testing.T) {
 
 // Stress the scheduler and attempt to load more models than will fit to cause thrashing
 // This test will always load at least 2 models even on CPU based systems
-func TestMultiModelStress(t *testing.T) {
+func runMultiModelStress(t *testing.T) {
+	if testModel != "" {
+		t.Skip("uses hardcoded models, not applicable with model override")
+	}
 	s := os.Getenv("OLLAMA_MAX_VRAM")
 	if s == "" {
 		s = "0"
@@ -82,7 +79,6 @@ func TestMultiModelStress(t *testing.T) {
 		"llama3.2:1b",
 		"qwen3:0.6b",
 		"gemma2:2b",
-		"deepseek-r1:1.5b", // qwen2 arch
 		"gemma3:270m",
 	}
 	mediumModels := []string{
@@ -109,12 +105,12 @@ func TestMultiModelStress(t *testing.T) {
 	defer cancel()
 	client, _, cleanup := InitServerConnection(ctx, t)
 	defer cleanup()
+	initialTimeout := 120 * time.Second
+	streamTimeout := 20 * time.Second
 
 	// Make sure all the models are pulled before we get started
 	for _, model := range chosenModels {
-		if err := PullIfMissing(ctx, client, model); err != nil {
-			t.Fatal(err)
-		}
+		pullOrSkip(ctx, t, client, model)
 	}
 
 	// Determine how many models we can load in parallel before we exceed VRAM
@@ -123,12 +119,8 @@ func TestMultiModelStress(t *testing.T) {
 	slog.Info("Loading models to find how many can fit in VRAM before overflowing")
 chooseModels:
 	for i, model := range chosenModels {
-		req := &api.GenerateRequest{Model: model}
-		slog.Info("loading", "model", model)
-		err = client.Generate(ctx, req, func(response api.GenerateResponse) error { return nil })
-		if err != nil {
-			t.Fatalf("failed to load model %s: %s", model, err)
-		}
+		// Leave KeepAlive unset so they stay loaded until the scheduler decides to unload them.
+		preloadGenerateModel(ctx, t, client, api.GenerateRequest{Model: model})
 		targetLoadCount++
 		if i > 0 {
 			models, err := client.ListRunning(ctx)
@@ -147,6 +139,8 @@ chooseModels:
 			for _, m := range models.Models {
 				if m.SizeVRAM == 0 {
 					slog.Info("model running on CPU", "name", m.Name, "target", targetLoadCount, "chosen", chosenModels[:targetLoadCount])
+					initialTimeout = 240 * time.Second
+					streamTimeout = 30 * time.Second
 					break chooseModels
 				}
 			}
@@ -157,13 +151,27 @@ chooseModels:
 		slog.Warn("all models being used without exceeding VRAM, set OLLAMA_MAX_VRAM so test can pick larger models")
 	}
 
+	// For some iGPU/CPU systems we may end up with lingering 5 minute load timeouts chewing up memory - force unload everything we tried
+	slog.Info("unloading test models")
+	for _, model := range chosenModels {
+		client.Generate(ctx, &api.GenerateRequest{Model: model, KeepAlive: &api.Duration{Duration: 0}}, func(rsp api.GenerateResponse) error { return nil })
+	}
+	defer func() {
+		// best effort unload once we're done with the real test
+		for _, model := range chosenModels {
+			client.Generate(ctx, &api.GenerateRequest{Model: model, KeepAlive: &api.Duration{Duration: 0}}, func(rsp api.GenerateResponse) error { return nil })
+		}
+	}()
+
 	r := rand.New(rand.NewSource(0))
 	var wg sync.WaitGroup
+
+	slog.Info("Starting main test...")
 	for i := range targetLoadCount {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			reqs, resps := GenerateRequests()
+			reqs, resps := ChatRequests()
 			for j := 0; j < 3; j++ {
 				if time.Now().Sub(started) > softTimeout {
 					slog.Info("exceeded soft timeout, winding down test")
@@ -171,11 +179,10 @@ chooseModels:
 				}
 				k := r.Int() % len(reqs)
 				reqs[k].Model = chosenModels[i]
-				slog.Info("Starting", "model", reqs[k].Model, "iteration", j, "request", reqs[k].Prompt)
-				DoGenerate(ctx, t, client, reqs[k], resps[k],
-					120*time.Second, // Be extra patient for the model to load initially
-					10*time.Second,  // Once results start streaming, fail if they stall
-				)
+				// Set a default timeout to ensure the scheduler unloads for resource needs, not expiration
+				reqs[k].KeepAlive = nil
+				slog.Info("Starting", "model", reqs[k].Model, "iteration", j, "request", reqs[k].Messages[0].Content)
+				DoChat(ctx, t, client, reqs[k], resps[k], initialTimeout, streamTimeout)
 			}
 		}(i)
 	}

@@ -1,4 +1,4 @@
-//go:build integration && models
+//go:build integration && release
 
 package integration
 
@@ -14,7 +14,11 @@ import (
 	"github.com/ollama/ollama/api"
 )
 
-func TestQuantization(t *testing.T) {
+func runQuantization(t *testing.T) {
+	if testModel != "" {
+		t.Skip("exercises quantization with a fixed source model, not applicable with model override")
+	}
+
 	sourceModels := []string{
 		"qwen2.5:0.5b-instruct-fp16",
 	}
@@ -33,9 +37,7 @@ func TestQuantization(t *testing.T) {
 	defer cleanup()
 
 	for _, base := range sourceModels {
-		if err := PullIfMissing(ctx, client, base); err != nil {
-			t.Fatalf("pull failed %s", err)
-		}
+		pullOrSkip(ctx, t, client, base)
 		for _, quant := range quantizations {
 			newName := fmt.Sprintf("%s__%s", base, quant)
 			t.Run(newName, func(t *testing.T) {
@@ -74,9 +76,14 @@ func TestQuantization(t *testing.T) {
 				}
 
 				stream := true
-				genReq := api.GenerateRequest{
-					Model:     newName,
-					Prompt:    "why is the sky blue?",
+				chatReq := api.ChatRequest{
+					Model: newName,
+					Messages: []api.Message{
+						{
+							Role:    "user",
+							Content: blueSkyPrompt,
+						},
+					},
 					KeepAlive: &api.Duration{Duration: 3 * time.Second},
 					Options: map[string]any{
 						"seed":        42,
@@ -88,14 +95,13 @@ func TestQuantization(t *testing.T) {
 
 				// Some smaller quantizations can cause models to have poor quality
 				// or get stuck in repetition loops, so we stop as soon as we have any matches
-				anyResp := []string{"rayleigh", "scattering", "day", "sun", "moon", "color", "nitrogen", "oxygen"}
 				reqCtx, reqCancel := context.WithCancel(ctx)
 				atLeastOne := false
 				var buf bytes.Buffer
-				genfn := func(response api.GenerateResponse) error {
-					buf.Write([]byte(response.Response))
+				chatfn := func(response api.ChatResponse) error {
+					buf.Write([]byte(response.Message.Content))
 					fullResp := strings.ToLower(buf.String())
-					for _, resp := range anyResp {
+					for _, resp := range blueSkyExpected {
 						if strings.Contains(fullResp, resp) {
 							atLeastOne = true
 							t.Log(fullResp)
@@ -109,14 +115,14 @@ func TestQuantization(t *testing.T) {
 				done := make(chan int)
 				var genErr error
 				go func() {
-					genErr = client.Generate(reqCtx, &genReq, genfn)
+					genErr = client.Chat(reqCtx, &chatReq, chatfn)
 					done <- 0
 				}()
 
 				select {
 				case <-done:
 					if genErr != nil && !atLeastOne {
-						t.Fatalf("failed with %s request prompt %s ", genReq.Model, genReq.Prompt)
+						t.Fatalf("failed with %s request prompt %s ", chatReq.Model, chatReq.Messages[0].Content)
 					}
 				case <-ctx.Done():
 					t.Error("outer test context done while waiting for generate")

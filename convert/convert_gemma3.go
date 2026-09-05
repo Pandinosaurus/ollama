@@ -2,6 +2,9 @@ package convert
 
 import (
 	"cmp"
+	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/ollama/ollama/fs/ggml"
 )
@@ -26,16 +29,26 @@ type gemma3Model struct {
 		NumChannels       uint32  `json:"num_channels"`        // num_channels 3
 		PatchSize         uint32  `json:"patch_size"`          // patch_size 14
 	} `json:"vision_config"`
-	MaxPositionEmbeddings    uint32  `json:"max_position_embeddings"`
-	NumAttentionHeads        uint32  `json:"num_attention_heads"`
-	NumKeyValueHeads         uint32  `json:"num_key_value_heads"`
-	RMSNormEPS               float32 `json:"rms_norm_eps"`
-	HeadDim                  uint32  `json:"head_dim"`
-	FinalLogitSoftcap        float32 `json:"final_logit_softcapping"`
-	RopeLocalTheta           float32 `json:"rope_local_base_freq"`
-	RopeGlobalTheta          float32 `json:"rope_global_base_freq"`
-	SlidingWindow            uint32  `json:"sliding_window"`
-	MultiModalTokensPerImage uint32  `json:"mm_tokens_per_image"`
+	MaxPositionEmbeddings    uint32   `json:"max_position_embeddings"`
+	NumAttentionHeads        uint32   `json:"num_attention_heads"`
+	NumKeyValueHeads         uint32   `json:"num_key_value_heads"`
+	RMSNormEPS               float32  `json:"rms_norm_eps"`
+	HeadDim                  uint32   `json:"head_dim"`
+	FinalLogitSoftcap        float32  `json:"final_logit_softcapping"`
+	RopeLocalTheta           float32  `json:"rope_local_base_freq"`
+	RopeTheta                float32  `json:"rope_theta"`
+	SlidingWindow            uint32   `json:"sliding_window"`
+	SlidingWindowPattern     *uint32  `json:"sliding_window_pattern"`
+	LayerTypes               []string `json:"layer_types"`
+	MultiModalTokensPerImage uint32   `json:"mm_tokens_per_image"`
+	RopeScaling              *struct {
+		Type                          string  `json:"rope_type"`
+		Factor                        float32 `json:"factor"`
+		OriginalMaxPositionEmbeddings uint32  `json:"original_max_position_embeddings"`
+		ExtrapolationFactor           float32 `json:"extrapolation_factor"`
+		BetaFast                      float32 `json:"beta_fast"`
+		BetaSlow                      float32 `json:"beta_slow"`
+	} `json:"rope_scaling"`
 }
 
 const (
@@ -44,7 +57,7 @@ const (
 	gemma27BLayerCount = 62
 )
 
-func (p *gemma3Model) KV(t *Tokenizer) ggml.KV {
+func (p *gemma3Model) KV(t *Tokenizer) KV {
 	kv := p.ModelParameters.KV(t)
 	kv["general.architecture"] = "gemma3"
 
@@ -81,9 +94,38 @@ func (p *gemma3Model) KV(t *Tokenizer) ggml.KV {
 		kv["gemma3.attention.key_length"] = p.HeadDim
 		kv["gemma3.attention.value_length"] = p.HeadDim
 		kv["gemma3.attention.sliding_window"] = p.SlidingWindow
-		kv["gemma3.final_logit_softcapping"] = cmp.Or(p.FinalLogitSoftcap, 30)
+
+		// The sliding window pattern is either provided as the sliding_window_pattern
+		// key (an int) or as the layer_types key (a list of strings).
+		if p.SlidingWindowPattern != nil || len(p.LayerTypes) > 0 {
+			kv["gemma3.attention.sliding_window_pattern"] = slices.Collect(func(yield func(bool) bool) {
+				for i := range numBlocks {
+					var isLocal bool
+					if len(p.LayerTypes) > 0 && int(i) < len(p.LayerTypes) {
+						isLocal = p.LayerTypes[i] == "sliding_attention"
+					} else if p.SlidingWindowPattern != nil && *p.SlidingWindowPattern > 0 {
+						isLocal = (i+1)%*p.SlidingWindowPattern != 0
+					}
+					if !yield(isLocal) {
+						break
+					}
+				}
+			})
+		}
+		if p.FinalLogitSoftcap > 0 {
+			kv["gemma3.final_logit_softcapping"] = p.FinalLogitSoftcap
+		}
 		kv["gemma3.rope.local.freq_base"] = cmp.Or(p.RopeLocalTheta, 10000.0)
-		kv["gemma3.rope.global.freq_base"] = cmp.Or(p.RopeGlobalTheta, 1000000.0)
+		kv["gemma3.rope.freq_base"] = cmp.Or(p.RopeTheta, 1000000.0)
+		if p.RopeScaling != nil && p.RopeScaling.Type == "yarn" && p.RopeScaling.Factor > 0 {
+			kv["gemma3.rope.scaling.type"] = "yarn"
+			kv["gemma3.rope.scaling.factor"] = p.RopeScaling.Factor
+			kv["gemma3.rope.scaling.original_context_length"] = p.RopeScaling.OriginalMaxPositionEmbeddings
+			kv["gemma3.rope.scaling.extrapolation_factor"] = cmp.Or(p.RopeScaling.ExtrapolationFactor, float32(1.0))
+			kv["gemma3.rope.scaling.beta_fast"] = cmp.Or(p.RopeScaling.BetaFast, float32(64.0))
+			kv["gemma3.rope.scaling.beta_slow"] = cmp.Or(p.RopeScaling.BetaSlow, float32(1.0))
+		}
+
 		kv["gemma3.embedding_length"] = p.HiddenSize
 		kv["gemma3.feed_forward_length"] = p.IntermediateSize
 	default:
@@ -139,4 +181,43 @@ func (p *gemma3Model) Replacements() []string {
 		"input_projection_weight", "input_projection.weight",
 		"multi_modal_projector", "mm",
 	}
+}
+
+func (p *gemma3Model) TensorsWithTokenizer(ts []Tensor, t *Tokenizer) []*ggml.Tensor {
+	vocabSize := uint64(0)
+	if t != nil && t.Vocabulary != nil {
+		vocabSize = uint64(len(t.Vocabulary.Tokens))
+	}
+
+	var out []*ggml.Tensor
+	for _, tensor := range ts {
+		name := tensor.Name()
+		gt := &ggml.Tensor{
+			Name:     name,
+			Kind:     tensor.Kind(),
+			Shape:    tensor.Shape(),
+			WriterTo: tensor,
+		}
+
+		if !strings.HasPrefix(name, "v.") && strings.HasSuffix(name, "_norm.weight") {
+			tensor.SetRepacker(p.addOne)
+		}
+
+		if vocabSize > 0 && name == "token_embd.weight" && len(gt.Shape) >= 2 && gt.Shape[0] > vocabSize {
+			gt.Shape = slices.Clone(gt.Shape)
+			embdDim := gt.Shape[1]
+			gt.Shape[0] = vocabSize
+			tensor.SetRepacker(func(_ string, data []float32, _ []uint64) ([]float32, error) {
+				n := vocabSize * embdDim
+				if uint64(len(data)) < n {
+					return nil, fmt.Errorf("gemma3 token_embd.weight has %d values, need %d", len(data), n)
+				}
+				return data[:n], nil
+			})
+		}
+
+		out = append(out, gt)
+	}
+
+	return out
 }

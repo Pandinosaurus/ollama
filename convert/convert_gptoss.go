@@ -30,32 +30,45 @@ type gptossModel struct {
 	RopeTheta             float32 `json:"rope_theta"`
 	RopeScalingFactor     float32 `json:"rope_scaling_factor"`
 	RopeScaling           struct {
-		Factor float32 `json:"factor"`
+		Type                          string  `json:"rope_type"`
+		Factor                        float32 `json:"factor"`
+		OriginalMaxPositionEmbeddings uint32  `json:"original_max_position_embeddings"`
+		BetaFast                      float32 `json:"beta_fast"`
+		BetaSlow                      float32 `json:"beta_slow"`
 	} `json:"rope_scaling"`
 	SlidingWindow uint32 `json:"sliding_window"`
 }
 
 var _ ModelConverter = (*gptossModel)(nil)
 
-func (m *gptossModel) KV(t *Tokenizer) ggml.KV {
+func (m *gptossModel) KV(t *Tokenizer) KV {
 	kv := m.ModelParameters.KV(t)
-	kv["general.architecture"] = "gptoss"
+	kv["general.architecture"] = "gpt-oss"
 	kv["general.file_type"] = uint32(4)
-	kv["gptoss.context_length"] = cmp.Or(m.MaxPositionEmbeddings, uint32(m.RopeScalingFactor*float32(m.InitialContextLength)))
-	kv["gptoss.block_count"] = m.HiddenLayers
-	kv["gptoss.embedding_length"] = m.HiddenSize
-	kv["gptoss.feed_forward_length"] = m.IntermediateSize
-	kv["gptoss.expert_count"] = cmp.Or(m.Experts, m.LocalExperts)
-	kv["gptoss.expert_used_count"] = m.ExpertsPerToken
-	kv["gptoss.attention.head_count"] = m.AttentionHeads
-	kv["gptoss.attention.head_count_kv"] = m.KeyValueHeads
-	kv["gptoss.attention.key_length"] = m.HeadDim
-	kv["gptoss.attention.value_length"] = m.HeadDim
-	kv["gptoss.attention.layer_norm_rms_epsilon"] = cmp.Or(m.RMSNormEpsilon, 1e-5)
-	kv["gptoss.attention.sliding_window"] = m.SlidingWindow
-	kv["gptoss.rope.freq_base"] = m.RopeTheta
-	kv["gptoss.rope.scaling.factor"] = cmp.Or(m.RopeScalingFactor, m.RopeScaling.Factor)
-	kv["gptoss.rope.scaling.original_context_length"] = m.InitialContextLength
+	kv["gpt-oss.context_length"] = cmp.Or(m.MaxPositionEmbeddings, uint32(m.RopeScalingFactor*float32(m.InitialContextLength)))
+	kv["gpt-oss.block_count"] = m.HiddenLayers
+	kv["gpt-oss.embedding_length"] = m.HiddenSize
+	kv["gpt-oss.feed_forward_length"] = m.IntermediateSize
+	kv["gpt-oss.expert_feed_forward_length"] = m.IntermediateSize
+	kv["gpt-oss.expert_count"] = cmp.Or(m.Experts, m.LocalExperts)
+	kv["gpt-oss.expert_used_count"] = m.ExpertsPerToken
+	kv["gpt-oss.attention.head_count"] = m.AttentionHeads
+	kv["gpt-oss.attention.head_count_kv"] = m.KeyValueHeads
+	kv["gpt-oss.attention.key_length"] = m.HeadDim
+	kv["gpt-oss.attention.value_length"] = m.HeadDim
+	kv["gpt-oss.attention.layer_norm_rms_epsilon"] = cmp.Or(m.RMSNormEpsilon, 1e-5)
+	kv["gpt-oss.attention.sliding_window"] = m.SlidingWindow
+	kv["gpt-oss.rope.freq_base"] = m.RopeTheta
+	kv["gpt-oss.rope.scaling.type"] = cmp.Or(m.RopeScaling.Type, "yarn")
+	kv["gpt-oss.rope.scaling.factor"] = cmp.Or(m.RopeScalingFactor, m.RopeScaling.Factor)
+	kv["gpt-oss.rope.scaling.original_context_length"] = cmp.Or(m.RopeScaling.OriginalMaxPositionEmbeddings, m.InitialContextLength)
+	if m.RopeScaling.BetaFast != 0 {
+		kv["gpt-oss.rope.scaling.yarn_beta_fast"] = m.RopeScaling.BetaFast
+	}
+	if m.RopeScaling.BetaSlow != 0 {
+		kv["gpt-oss.rope.scaling.yarn_beta_slow"] = m.RopeScaling.BetaSlow
+	}
+	kv["tokenizer.ggml.pre"] = "gpt-4o"
 	kv["tokenizer.ggml.bos_token_id"] = uint32(199998) // <|startoftext|>
 	kv["tokenizer.ggml.add_bos_token"] = false
 	kv["tokenizer.ggml.eos_token_id"] = uint32(199999) // <|endoftext|>
@@ -85,6 +98,19 @@ func (m *gptossModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			case "scales":
 				mxfp4s[name].scales = t
 			}
+		} else if strings.HasSuffix(t.Name(), "gate_up_exps.bias") {
+			// gate_up_exps is interleaved, need to split into gate_exps and up_exps
+			// e.g. gate_exps, up_exps = gate_up_exps[:, 0::2, ...], gate_up_exps[:, 1::2, ...]
+			out = append(out, slices.Collect(splitDim(t, 1,
+				split{
+					Replacer: strings.NewReplacer("gate_up_exps", "gate_exps"),
+					slices:   []tensor.Slice{nil, tensor.S(0, int(t.Shape()[1]), 2)},
+				},
+				split{
+					Replacer: strings.NewReplacer("gate_up_exps", "up_exps"),
+					slices:   []tensor.Slice{nil, tensor.S(1, int(t.Shape()[1]), 2)},
+				},
+			))...)
 		} else {
 			out = append(out, &ggml.Tensor{
 				Name:     t.Name(),
@@ -97,17 +123,31 @@ func (m *gptossModel) Tensors(ts []Tensor) []*ggml.Tensor {
 
 	for name, mxfp4 := range mxfp4s {
 		dims := mxfp4.blocks.Shape()
-
 		if !strings.HasSuffix(name, ".weight") {
-			name += ".weight"
+			name = name + ".weight"
 		}
-
-		out = append(out, &ggml.Tensor{
-			Name:     name,
-			Kind:     uint32(ggml.TensorTypeMXFP4),
-			Shape:    []uint64{dims[0], dims[1], dims[2] * dims[3] * 2},
-			WriterTo: mxfp4,
-		})
+		if strings.Contains(name, "ffn_down_exps") {
+			out = append(out, &ggml.Tensor{
+				Name:     name,
+				Kind:     uint32(ggml.TensorTypeMXFP4),
+				Shape:    []uint64{dims[0], dims[1], dims[2] * dims[3] * 2},
+				WriterTo: mxfp4,
+			})
+		} else if strings.Contains(name, "ffn_gate_up_exps") {
+			// gate_up_exps is interleaved, need to split into gate_exps and up_exps
+			// e.g. gate_exps, up_exps = gate_up_exps[:, 0::2, ...], gate_up_exps[:, 1::2, ...]
+			out = append(out, &ggml.Tensor{
+				Name:     strings.Replace(name, "gate_up", "gate", 1),
+				Kind:     uint32(ggml.TensorTypeMXFP4),
+				Shape:    []uint64{dims[0], dims[1] / 2, dims[2] * dims[3] * 2},
+				WriterTo: mxfp4.slice(1, 0, int(dims[1]), 2),
+			}, &ggml.Tensor{
+				Name:     strings.Replace(name, "gate_up", "up", 1),
+				Kind:     uint32(ggml.TensorTypeMXFP4),
+				Shape:    []uint64{dims[0], dims[1] / 2, dims[2] * dims[3] * 2},
+				WriterTo: mxfp4.slice(1, 1, int(dims[1]), 2),
+			})
+		}
 	}
 
 	return out
@@ -125,9 +165,9 @@ func (m *gptossModel) Replacements() []string {
 			"self_attn.q_proj", "attn_q",
 			"self_attn.k_proj", "attn_k",
 			"self_attn.v_proj", "attn_v",
-			"self_attn.o_proj", "attn_out",
-			"self_attn.sinks", "attn_sinks",
-			"post_attention_layernorm", "ffn_norm",
+			"self_attn.o_proj", "attn_output",
+			"self_attn.sinks", "attn_sinks.weight",
+			"post_attention_layernorm", "post_attention_norm",
 			"mlp.router", "ffn_gate_inp",
 			"mlp.experts.gate_up_proj_", "ffn_gate_up_exps.",
 			"mlp.experts.down_proj_", "ffn_down_exps.",
@@ -142,9 +182,9 @@ func (m *gptossModel) Replacements() []string {
 			"block", "blk",
 			"attn.norm", "attn_norm",
 			"attn.qkv", "attn_qkv",
-			"attn.sinks", "attn_sinks",
-			"attn.out", "attn_out",
-			"mlp.norm", "ffn_norm",
+			"attn.sinks", "attn_sinks.weight",
+			"attn.out", "attn_output",
+			"mlp.norm", "post_attention_norm",
 			"mlp.gate", "ffn_gate_inp",
 			"mlp.mlp1_", "ffn_gate_up_exps.",
 			"mlp.mlp2_", "ffn_down_exps.",
@@ -158,7 +198,19 @@ func (m *gptossModel) Replacements() []string {
 }
 
 type mxfp4 struct {
+	slices []tensor.Slice
+
 	blocks, scales Tensor
+}
+
+func (m *mxfp4) slice(dim, start, end, step int) *mxfp4 {
+	slice := slices.Repeat([]tensor.Slice{nil}, len(m.blocks.Shape()))
+	slice[dim] = tensor.S(start, end, step)
+	return &mxfp4{
+		slices: slice,
+		blocks: m.blocks,
+		scales: m.scales,
+	}
 }
 
 func (m *mxfp4) WriteTo(w io.Writer) (int64, error) {
@@ -202,6 +254,13 @@ func (m *mxfp4) WriteTo(w io.Writer) (int64, error) {
 	out, err := tensor.Concat(3, scales, blocks)
 	if err != nil {
 		return 0, err
+	}
+
+	if len(m.slices) > 0 {
+		out, err = out.Slice(m.slices...)
+		if err != nil {
+			return 0, err
+		}
 	}
 
 	out = tensor.Materialize(out)

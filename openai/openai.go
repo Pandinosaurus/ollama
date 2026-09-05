@@ -1,26 +1,22 @@
-// openai package provides middleware for partial compatibility with the OpenAI REST API
+// openai package provides core transformation logic for partial compatibility with the OpenAI REST API
 package openai
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"math/rand"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
-
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/types/model"
 )
-
-var finishReasonToolCalls = "tool_calls"
 
 type Error struct {
 	Message string  `json:"message"`
@@ -42,28 +38,49 @@ type Message struct {
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
 
+// Delta is used in streaming chunk responses. All fields use omitempty so
+// that a finish chunk produces a truly empty delta `{}` matching the OpenAI spec.
+type Delta struct {
+	Role      string     `json:"role,omitempty"`
+	Content   any        `json:"content,omitempty"`
+	Reasoning string     `json:"reasoning,omitempty"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+}
+
+type ChoiceLogprobs struct {
+	Content []api.Logprob `json:"content"`
+}
+
 type Choice struct {
-	Index        int     `json:"index"`
-	Message      Message `json:"message"`
-	FinishReason *string `json:"finish_reason"`
+	Index        int             `json:"index"`
+	Message      Message         `json:"message"`
+	FinishReason *string         `json:"finish_reason"`
+	Logprobs     *ChoiceLogprobs `json:"logprobs,omitempty"`
 }
 
 type ChunkChoice struct {
-	Index        int     `json:"index"`
-	Delta        Message `json:"delta"`
-	FinishReason *string `json:"finish_reason"`
+	Index        int             `json:"index"`
+	Delta        Delta           `json:"delta"`
+	FinishReason *string         `json:"finish_reason"`
+	Logprobs     *ChoiceLogprobs `json:"logprobs,omitempty"`
 }
 
 type CompleteChunkChoice struct {
-	Text         string  `json:"text"`
-	Index        int     `json:"index"`
-	FinishReason *string `json:"finish_reason"`
+	Text         string          `json:"text"`
+	Index        int             `json:"index"`
+	FinishReason *string         `json:"finish_reason"`
+	Logprobs     *ChoiceLogprobs `json:"logprobs,omitempty"`
+}
+
+type PromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
 }
 
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens        int                  `json:"prompt_tokens"`
+	PromptTokensDetails *PromptTokensDetails `json:"prompt_tokens_details,omitempty"`
+	CompletionTokens    int                  `json:"completion_tokens"`
+	TotalTokens         int                  `json:"total_tokens"`
 }
 
 type ResponseFormat struct {
@@ -76,8 +93,10 @@ type JsonSchema struct {
 }
 
 type EmbedRequest struct {
-	Input any    `json:"input"`
-	Model string `json:"model"`
+	Input          any    `json:"input"`
+	Model          string `json:"model"`
+	Dimensions     int    `json:"dimensions,omitempty"`
+	EncodingFormat string `json:"encoding_format,omitempty"` // "float" or "base64"
 }
 
 type StreamOptions struct {
@@ -85,7 +104,7 @@ type StreamOptions struct {
 }
 
 type Reasoning struct {
-	Effort *string `json:"effort,omitempty"`
+	Effort string `json:"effort,omitempty"`
 }
 
 type ChatCompletionRequest struct {
@@ -104,16 +123,20 @@ type ChatCompletionRequest struct {
 	Tools            []api.Tool      `json:"tools"`
 	Reasoning        *Reasoning      `json:"reasoning,omitempty"`
 	ReasoningEffort  *string         `json:"reasoning_effort,omitempty"`
+	Logprobs         *bool           `json:"logprobs"`
+	TopLogprobs      int             `json:"top_logprobs"`
+	DebugRenderOnly  bool            `json:"_debug_render_only"`
 }
 
 type ChatCompletion struct {
-	Id                string   `json:"id"`
-	Object            string   `json:"object"`
-	Created           int64    `json:"created"`
-	Model             string   `json:"model"`
-	SystemFingerprint string   `json:"system_fingerprint"`
-	Choices           []Choice `json:"choices"`
-	Usage             Usage    `json:"usage,omitempty"`
+	Id                string         `json:"id"`
+	Object            string         `json:"object"`
+	Created           int64          `json:"created"`
+	Model             string         `json:"model"`
+	SystemFingerprint string         `json:"system_fingerprint"`
+	Choices           []Choice       `json:"choices"`
+	Usage             Usage          `json:"usage,omitempty"`
+	DebugInfo         *api.DebugInfo `json:"_debug_info,omitempty"`
 }
 
 type ChatCompletionChunk struct {
@@ -140,6 +163,8 @@ type CompletionRequest struct {
 	Temperature      *float32       `json:"temperature"`
 	TopP             float32        `json:"top_p"`
 	Suffix           string         `json:"suffix"`
+	Logprobs         *int           `json:"logprobs"`
+	DebugRenderOnly  bool           `json:"_debug_render_only"`
 }
 
 type Completion struct {
@@ -180,9 +205,9 @@ type Model struct {
 }
 
 type Embedding struct {
-	Object    string    `json:"object"`
-	Embedding []float32 `json:"embedding"`
-	Index     int       `json:"index"`
+	Object    string `json:"object"`
+	Embedding any    `json:"embedding"` // Can be []float32 (float format) or string (base64 format)
+	Index     int    `json:"index"`
 }
 
 type ListCompletion struct {
@@ -216,27 +241,24 @@ func NewError(code int, message string) ErrorResponse {
 	return ErrorResponse{Error{Type: etype, Message: message}}
 }
 
-func toUsage(r api.ChatResponse) Usage {
-	return Usage{
-		PromptTokens:     r.PromptEvalCount,
-		CompletionTokens: r.EvalCount,
-		TotalTokens:      r.PromptEvalCount + r.EvalCount,
+// ToUsage converts an api.ChatResponse to Usage
+func ToUsage(r api.ChatResponse) Usage {
+	usage := Usage{
+		PromptTokens:     r.Metrics.PromptEvalCount,
+		CompletionTokens: r.Metrics.EvalCount,
+		TotalTokens:      r.Metrics.PromptEvalCount + r.Metrics.EvalCount,
 	}
+	if r.Metrics.PromptEvalCachedCount != nil {
+		usage.PromptTokensDetails = &PromptTokensDetails{CachedTokens: *r.Metrics.PromptEvalCachedCount}
+	}
+	return usage
 }
 
-func toolCallId() string {
-	const letterBytes = "abcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, 8)
-	for i := range b {
-		b[i] = letterBytes[rand.Intn(len(letterBytes))]
-	}
-	return "call_" + strings.ToLower(string(b))
-}
-
-func toToolCalls(tc []api.ToolCall) []ToolCall {
+// ToToolCalls converts api.ToolCall to OpenAI ToolCall format
+func ToToolCalls(tc []api.ToolCall) []ToolCall {
 	toolCalls := make([]ToolCall, len(tc))
 	for i, tc := range tc {
-		toolCalls[i].ID = toolCallId()
+		toolCalls[i].ID = tc.ID
 		toolCalls[i].Type = "function"
 		toolCalls[i].Function.Name = tc.Function.Name
 		toolCalls[i].Index = tc.Function.Index
@@ -252,8 +274,15 @@ func toToolCalls(tc []api.ToolCall) []ToolCall {
 	return toolCalls
 }
 
-func toChatCompletion(id string, r api.ChatResponse) ChatCompletion {
-	toolCalls := toToolCalls(r.Message.ToolCalls)
+// ToChatCompletion converts an api.ChatResponse to ChatCompletion
+func ToChatCompletion(id string, r api.ChatResponse) ChatCompletion {
+	toolCalls := ToToolCalls(r.Message.ToolCalls)
+
+	var logprobs *ChoiceLogprobs
+	if len(r.Logprobs) > 0 {
+		logprobs = &ChoiceLogprobs{Content: r.Logprobs}
+	}
+
 	return ChatCompletion{
 		Id:                id,
 		Object:            "chat.completion",
@@ -264,7 +293,7 @@ func toChatCompletion(id string, r api.ChatResponse) ChatCompletion {
 			Index:   0,
 			Message: Message{Role: r.Message.Role, Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
 			FinishReason: func(reason string) *string {
-				if len(toolCalls) > 0 {
+				if reason == "stop" && len(toolCalls) > 0 {
 					reason = "tool_calls"
 				}
 				if len(reason) > 0 {
@@ -272,44 +301,123 @@ func toChatCompletion(id string, r api.ChatResponse) ChatCompletion {
 				}
 				return nil
 			}(r.DoneReason),
-		}},
-		Usage: toUsage(r),
+			Logprobs: logprobs,
+		}}, Usage: ToUsage(r),
+		DebugInfo: r.DebugInfo,
 	}
 }
 
-func toChunk(id string, r api.ChatResponse, toolCallSent bool) ChatCompletionChunk {
-	toolCalls := toToolCalls(r.Message.ToolCalls)
+func toChunk(id string, r api.ChatResponse, includeRole bool) ChatCompletionChunk {
+	toolCalls := ToToolCalls(r.Message.ToolCalls)
+
+	var logprobs *ChoiceLogprobs
+	if len(r.Logprobs) > 0 {
+		logprobs = &ChoiceLogprobs{Content: r.Logprobs}
+	}
+
+	var role string
+	if includeRole {
+		role = "assistant"
+	}
+
+	// Content is typed as any with omitempty: nil is omitted, "" is kept.
+	// Use the string value from the response so empty-string content (e.g. first
+	// chunk or reasoning-only) is explicitly serialized as "content":"".
+	var content any = r.Message.Content
+
+	// Stamp the chunk with the response's timestamp; OpenAI reuses one created
+	// value across a stream. Fall back to now when the response carries none
+	// (e.g. synthetic responses).
+	created := r.CreatedAt.Unix()
+	if r.CreatedAt.IsZero() {
+		created = time.Now().Unix()
+	}
+
 	return ChatCompletionChunk{
 		Id:                id,
 		Object:            "chat.completion.chunk",
-		Created:           time.Now().Unix(),
+		Created:           created,
 		Model:             r.Model,
 		SystemFingerprint: "fp_ollama",
 		Choices: []ChunkChoice{{
-			Index: 0,
-			Delta: Message{Role: "assistant", Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
-			FinishReason: func(reason string) *string {
-				if len(reason) > 0 {
-					if toolCallSent || len(toolCalls) > 0 {
-						return &finishReasonToolCalls
-					}
-					return &reason
-				}
-				return nil
-			}(r.DoneReason),
+			Index:    0,
+			Delta:    Delta{Role: role, Content: content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
+			Logprobs: logprobs,
 		}},
 	}
 }
 
-func toUsageGenerate(r api.GenerateResponse) Usage {
-	return Usage{
-		PromptTokens:     r.PromptEvalCount,
-		CompletionTokens: r.EvalCount,
-		TotalTokens:      r.PromptEvalCount + r.EvalCount,
+// ToStreamChunks converts an api.ChatResponse to one or more ChatCompletionChunk values.
+// includeRole controls whether the "role" field appears in the delta (should be true
+// only for the first chunk in a stream, matching the OpenAI spec).
+func ToStreamChunks(id string, r api.ChatResponse, includeRole bool) []ChatCompletionChunk {
+	hasMixedResponse := r.Message.Thinking != "" && (r.Message.Content != "" || len(r.Message.ToolCalls) > 0)
+	if !hasMixedResponse {
+		return []ChatCompletionChunk{toChunk(id, r, includeRole)}
+	}
+
+	reasoningChunk := toChunk(id, r, includeRole)
+	// The logprobs here might include tokens not in this chunk because we now split between thinking and content/tool calls.
+	reasoningChunk.Choices[0].Delta.Content = nil
+	reasoningChunk.Choices[0].Delta.ToolCalls = nil
+
+	contentOrToolCallsChunk := toChunk(id, r, false)
+	// Keep both split chunks on the same timestamp since they represent one logical emission.
+	contentOrToolCallsChunk.Created = reasoningChunk.Created
+	contentOrToolCallsChunk.Choices[0].Delta.Reasoning = ""
+	contentOrToolCallsChunk.Choices[0].Logprobs = nil
+
+	return []ChatCompletionChunk{
+		reasoningChunk,
+		contentOrToolCallsChunk,
 	}
 }
 
-func toCompletion(id string, r api.GenerateResponse) Completion {
+// FinishChunk creates a dedicated finish-reason chunk with an empty delta,
+// matching the OpenAI spec where finish_reason is sent on its own chunk.
+func FinishChunk(id string, r api.ChatResponse, toolCallSent bool) ChatCompletionChunk {
+	// Only remap known terminal reasons; pass anything else through untouched.
+	// tool_calls only overrides stop — an unfinished or unknown done reason
+	// must not be relabeled tool_calls.
+	reason := cmp.Or(r.DoneReason, "stop")
+	if reason == "stop" && toolCallSent {
+		reason = "tool_calls"
+	}
+	// Stamp the chunk with the completion's timestamp like OpenAI does; fall
+	// back to now when the response carries none (e.g. synthetic responses).
+	created := r.CreatedAt.Unix()
+	if r.CreatedAt.IsZero() {
+		created = time.Now().Unix()
+	}
+	return ChatCompletionChunk{
+		Id:                id,
+		Object:            "chat.completion.chunk",
+		Created:           created,
+		Model:             r.Model,
+		SystemFingerprint: "fp_ollama",
+		Choices: []ChunkChoice{{
+			Index:        0,
+			Delta:        Delta{},
+			FinishReason: &reason,
+		}},
+	}
+}
+
+// ToUsageGenerate converts an api.GenerateResponse to Usage
+func ToUsageGenerate(r api.GenerateResponse) Usage {
+	usage := Usage{
+		PromptTokens:     r.Metrics.PromptEvalCount,
+		CompletionTokens: r.Metrics.EvalCount,
+		TotalTokens:      r.Metrics.PromptEvalCount + r.Metrics.EvalCount,
+	}
+	if r.Metrics.PromptEvalCachedCount != nil {
+		usage.PromptTokensDetails = &PromptTokensDetails{CachedTokens: *r.Metrics.PromptEvalCachedCount}
+	}
+	return usage
+}
+
+// ToCompletion converts an api.GenerateResponse to Completion
+func ToCompletion(id string, r api.GenerateResponse) Completion {
 	return Completion{
 		Id:                id,
 		Object:            "text_completion",
@@ -326,11 +434,12 @@ func toCompletion(id string, r api.GenerateResponse) Completion {
 				return nil
 			}(r.DoneReason),
 		}},
-		Usage: toUsageGenerate(r),
+		Usage: ToUsageGenerate(r),
 	}
 }
 
-func toCompleteChunk(id string, r api.GenerateResponse) CompletionChunk {
+// ToCompleteChunk converts an api.GenerateResponse to CompletionChunk
+func ToCompleteChunk(id string, r api.GenerateResponse) CompletionChunk {
 	return CompletionChunk{
 		Id:                id,
 		Object:            "text_completion",
@@ -350,14 +459,20 @@ func toCompleteChunk(id string, r api.GenerateResponse) CompletionChunk {
 	}
 }
 
-func toListCompletion(r api.ListResponse) ListCompletion {
+// ToListCompletion converts an api.ListResponse to ListCompletion
+func ToListCompletion(r api.ListResponse) ListCompletion {
 	var data []Model
 	for _, m := range r.Models {
+		id := m.Model
+		if id == "" {
+			id = m.Name
+		}
+
 		data = append(data, Model{
-			Id:      m.Name,
+			Id:      id,
 			Object:  "model",
 			Created: m.ModifiedAt.Unix(),
-			OwnedBy: model.ParseName(m.Name).Namespace,
+			OwnedBy: model.ParseName(id).Namespace,
 		})
 	}
 
@@ -367,13 +482,22 @@ func toListCompletion(r api.ListResponse) ListCompletion {
 	}
 }
 
-func toEmbeddingList(model string, r api.EmbedResponse) EmbeddingList {
+// ToEmbeddingList converts an api.EmbedResponse to EmbeddingList
+// encodingFormat can be "float", "base64", or empty (defaults to "float")
+func ToEmbeddingList(model string, r api.EmbedResponse, encodingFormat string) EmbeddingList {
 	if r.Embeddings != nil {
 		var data []Embedding
 		for i, e := range r.Embeddings {
+			var embedding any
+			if strings.EqualFold(encodingFormat, "base64") {
+				embedding = floatsToBase64(e)
+			} else {
+				embedding = e
+			}
+
 			data = append(data, Embedding{
 				Object:    "embedding",
-				Embedding: e,
+				Embedding: embedding,
 				Index:     i,
 			})
 		}
@@ -392,7 +516,15 @@ func toEmbeddingList(model string, r api.EmbedResponse) EmbeddingList {
 	return EmbeddingList{}
 }
 
-func toModel(r api.ShowResponse, m string) Model {
+// floatsToBase64 encodes a []float32 to a base64 string
+func floatsToBase64(floats []float32) string {
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.LittleEndian, floats)
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+// ToModel converts an api.ShowResponse to Model
+func ToModel(r api.ShowResponse, m string) Model {
 	return Model{
 		Id:      m,
 		Object:  "model",
@@ -401,7 +533,33 @@ func toModel(r api.ShowResponse, m string) Model {
 	}
 }
 
-func fromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
+// thinkFromReasoningEffort converts an OpenAI reasoning effort to the equivalent
+// Ollama think value. An empty effort leaves thinking at the model's default.
+//
+// OpenAI's scale extends past both ends of Ollama's ("minimal" below "low",
+// "xhigh" above "high"), and clients built on it add tiers of their own
+// ("ultra"). Clamp those to the nearest Ollama tier rather than rejecting the
+// request, since the alternative is a 400 for an effort the client considers
+// perfectly valid.
+func thinkFromReasoningEffort(effort string) (*api.ThinkValue, error) {
+	switch effort {
+	case "":
+		return nil, nil
+	case "none":
+		return &api.ThinkValue{Value: false}, nil
+	case "minimal":
+		return &api.ThinkValue{Value: "low"}, nil
+	case "low", "medium", "high", "max":
+		return &api.ThinkValue{Value: effort}, nil
+	case "xhigh", "ultra":
+		return &api.ThinkValue{Value: "max"}, nil
+	default:
+		return nil, fmt.Errorf("invalid reasoning value: %q (must be \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\", \"ultra\", \"max\", or \"none\")", effort)
+	}
+}
+
+// FromChatRequest converts a ChatCompletionRequest to api.ChatRequest
+func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 	var messages []api.Message
 	for _, msg := range r.Messages {
 		toolName := ""
@@ -413,11 +571,11 @@ func fromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 		}
 		switch content := msg.Content.(type) {
 		case string:
-			toolCalls, err := fromCompletionToolCall(msg.ToolCalls)
+			toolCalls, err := FromCompletionToolCall(msg.ToolCalls)
 			if err != nil {
 				return nil, err
 			}
-			messages = append(messages, api.Message{Role: msg.Role, Content: content, Thinking: msg.Reasoning, ToolCalls: toolCalls, ToolName: toolName})
+			messages = append(messages, api.Message{Role: msg.Role, Content: content, Thinking: msg.Reasoning, ToolCalls: toolCalls, ToolName: toolName, ToolCallID: msg.ToolCallID})
 		case []any:
 			for _, c := range content {
 				data, ok := c.(map[string]any)
@@ -443,27 +601,26 @@ func fromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 						}
 					}
 
-					types := []string{"jpeg", "jpg", "png", "webp"}
-					valid := false
-					for _, t := range types {
-						prefix := "data:image/" + t + ";base64,"
-						if strings.HasPrefix(url, prefix) {
-							url = strings.TrimPrefix(url, prefix)
-							valid = true
-							break
-						}
-					}
-
-					if !valid {
-						return nil, errors.New("invalid image input")
-					}
-
-					img, err := base64.StdEncoding.DecodeString(url)
+					img, err := decodeImageURL(url)
 					if err != nil {
-						return nil, errors.New("invalid message format")
+						return nil, err
 					}
 
 					messages = append(messages, api.Message{Role: msg.Role, Images: []api.ImageData{img}})
+				case "input_audio":
+					audioMap, ok := data["input_audio"].(map[string]any)
+					if !ok {
+						return nil, errors.New("invalid input_audio format")
+					}
+					b64Data, ok := audioMap["data"].(string)
+					if !ok {
+						return nil, errors.New("invalid input_audio format: missing data")
+					}
+					audioBytes, err := base64.StdEncoding.DecodeString(b64Data)
+					if err != nil {
+						return nil, fmt.Errorf("invalid input_audio base64 data: %w", err)
+					}
+					messages = append(messages, api.Message{Role: msg.Role, Images: []api.ImageData{audioBytes}})
 				default:
 					return nil, errors.New("invalid message format")
 				}
@@ -471,14 +628,13 @@ func fromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 			// since we might have added multiple messages above, if we have tools
 			// calls we'll add them to the last message
 			if len(messages) > 0 && len(msg.ToolCalls) > 0 {
-				toolCalls, err := fromCompletionToolCall(msg.ToolCalls)
+				toolCalls, err := FromCompletionToolCall(msg.ToolCalls)
 				if err != nil {
 					return nil, err
 				}
 				messages[len(messages)-1].ToolCalls = toolCalls
-				if toolName != "" {
-					messages[len(messages)-1].ToolName = toolName
-				}
+				messages[len(messages)-1].ToolName = toolName
+				messages[len(messages)-1].ToolCallID = msg.ToolCallID
 				messages[len(messages)-1].Thinking = msg.Reasoning
 			}
 		default:
@@ -487,15 +643,11 @@ func fromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 				return nil, fmt.Errorf("invalid message content type: %T", content)
 			}
 
-			toolCalls := make([]api.ToolCall, len(msg.ToolCalls))
-			for i, tc := range msg.ToolCalls {
-				toolCalls[i].Function.Name = tc.Function.Name
-				err := json.Unmarshal([]byte(tc.Function.Arguments), &toolCalls[i].Function.Arguments)
-				if err != nil {
-					return nil, errors.New("invalid tool call arguments")
-				}
+			toolCalls, err := FromCompletionToolCall(msg.ToolCalls)
+			if err != nil {
+				return nil, err
 			}
-			messages = append(messages, api.Message{Role: msg.Role, Thinking: msg.Reasoning, ToolCalls: toolCalls})
+			messages = append(messages, api.Message{Role: msg.Role, Thinking: msg.Reasoning, ToolCalls: toolCalls, ToolCallID: msg.ToolCallID})
 		}
 	}
 
@@ -555,25 +707,30 @@ func fromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 		}
 	}
 
-	var think *api.ThinkValue
+	var effort string
+
 	if r.Reasoning != nil {
-		think = &api.ThinkValue{
-			Value: *r.Reasoning.Effort,
-		}
+		effort = r.Reasoning.Effort
 	} else if r.ReasoningEffort != nil {
-		think = &api.ThinkValue{
-			Value: *r.ReasoningEffort,
-		}
+		effort = *r.ReasoningEffort
+	}
+
+	think, err := thinkFromReasoningEffort(effort)
+	if err != nil {
+		return nil, err
 	}
 
 	return &api.ChatRequest{
-		Model:    r.Model,
-		Messages: messages,
-		Format:   format,
-		Options:  options,
-		Stream:   &r.Stream,
-		Tools:    r.Tools,
-		Think:    think,
+		Model:           r.Model,
+		Messages:        messages,
+		Format:          format,
+		Options:         options,
+		Stream:          &r.Stream,
+		Tools:           r.Tools,
+		Think:           think,
+		Logprobs:        r.Logprobs != nil && *r.Logprobs,
+		TopLogprobs:     r.TopLogprobs,
+		DebugRenderOnly: r.DebugRenderOnly,
 	}, nil
 }
 
@@ -591,9 +748,44 @@ func nameFromToolCallID(messages []Message, toolCallID string) string {
 	return ""
 }
 
-func fromCompletionToolCall(toolCalls []ToolCall) ([]api.ToolCall, error) {
+// decodeImageURL decodes a base64 data URI into raw image bytes.
+func decodeImageURL(url string) (api.ImageData, error) {
+	if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+		return nil, errors.New("image URLs are not currently supported, please use base64 encoded data instead")
+	}
+
+	types := []string{"jpeg", "jpg", "png", "webp"}
+
+	// Support blank mime type to match /api/chat's behavior of taking just unadorned base64
+	if strings.HasPrefix(url, "data:;base64,") {
+		url = strings.TrimPrefix(url, "data:;base64,")
+	} else {
+		valid := false
+		for _, t := range types {
+			prefix := "data:image/" + t + ";base64,"
+			if strings.HasPrefix(url, prefix) {
+				url = strings.TrimPrefix(url, prefix)
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			return nil, errors.New("invalid image input")
+		}
+	}
+
+	img, err := base64.StdEncoding.DecodeString(url)
+	if err != nil {
+		return nil, errors.New("invalid image input")
+	}
+	return img, nil
+}
+
+// FromCompletionToolCall converts OpenAI ToolCall format to api.ToolCall
+func FromCompletionToolCall(toolCalls []ToolCall) ([]api.ToolCall, error) {
 	apiToolCalls := make([]api.ToolCall, len(toolCalls))
 	for i, tc := range toolCalls {
+		apiToolCalls[i].ID = tc.ID
 		apiToolCalls[i].Function.Name = tc.Function.Name
 		err := json.Unmarshal([]byte(tc.Function.Arguments), &apiToolCalls[i].Function.Arguments)
 		if err != nil {
@@ -604,7 +796,8 @@ func fromCompletionToolCall(toolCalls []ToolCall) ([]api.ToolCall, error) {
 	return apiToolCalls, nil
 }
 
-func fromCompleteRequest(r CompletionRequest) (api.GenerateRequest, error) {
+// FromCompleteRequest converts a CompletionRequest to api.GenerateRequest
+func FromCompleteRequest(r CompletionRequest) (api.GenerateRequest, error) {
 	options := make(map[string]any)
 
 	switch stop := r.Stop.(type) {
@@ -646,421 +839,62 @@ func fromCompleteRequest(r CompletionRequest) (api.GenerateRequest, error) {
 		options["top_p"] = 1.0
 	}
 
+	var logprobs bool
+	var topLogprobs int
+	if r.Logprobs != nil && *r.Logprobs > 0 {
+		logprobs = true
+		topLogprobs = *r.Logprobs
+	}
+
 	return api.GenerateRequest{
-		Model:   r.Model,
-		Prompt:  r.Prompt,
-		Options: options,
-		Stream:  &r.Stream,
-		Suffix:  r.Suffix,
+		Model:           r.Model,
+		Prompt:          r.Prompt,
+		Options:         options,
+		Stream:          &r.Stream,
+		Suffix:          r.Suffix,
+		Logprobs:        logprobs,
+		TopLogprobs:     topLogprobs,
+		DebugRenderOnly: r.DebugRenderOnly,
 	}, nil
 }
 
-type BaseWriter struct {
-	gin.ResponseWriter
+// TranscriptionResponse is the response format for /v1/audio/transcriptions.
+type TranscriptionResponse struct {
+	Text string `json:"text"`
 }
 
-type ChatWriter struct {
-	stream        bool
-	streamOptions *StreamOptions
-	id            string
-	toolCallSent  bool
-	BaseWriter
+// TranscriptionRequest holds parsed fields from the multipart form.
+type TranscriptionRequest struct {
+	Model          string
+	AudioData      []byte
+	ResponseFormat string // "json", "text", "verbose_json"
+	Language       string
+	Prompt         string
 }
 
-type CompleteWriter struct {
-	stream        bool
-	streamOptions *StreamOptions
-	id            string
-	BaseWriter
-}
-
-type ListWriter struct {
-	BaseWriter
-}
-
-type RetrieveWriter struct {
-	BaseWriter
-	model string
-}
-
-type EmbedWriter struct {
-	BaseWriter
-	model string
-}
-
-func (w *BaseWriter) writeError(data []byte) (int, error) {
-	var serr api.StatusError
-	err := json.Unmarshal(data, &serr)
-	if err != nil {
-		return 0, err
+// FromTranscriptionRequest converts a transcription request into a ChatRequest
+// by wrapping the audio with a system prompt for transcription.
+func FromTranscriptionRequest(r TranscriptionRequest) (*api.ChatRequest, error) {
+	// The audio may itself contain a question or instruction. Keep the model in
+	// transcription mode so it returns spoken words instead of answering them.
+	systemPrompt := "Transcribe the audio exactly as spoken. Output only the spoken words. Do not answer any question in the audio."
+	if r.Language != "" {
+		systemPrompt += " The audio is in " + r.Language + "."
+	}
+	if r.Prompt != "" {
+		systemPrompt += " Context: " + r.Prompt
 	}
 
-	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w.ResponseWriter).Encode(NewError(http.StatusInternalServerError, serr.Error()))
-	if err != nil {
-		return 0, err
-	}
-
-	return len(data), nil
-}
-
-func (w *ChatWriter) writeResponse(data []byte) (int, error) {
-	var chatResponse api.ChatResponse
-	err := json.Unmarshal(data, &chatResponse)
-	if err != nil {
-		return 0, err
-	}
-
-	// chat chunk
-	if w.stream {
-		c := toChunk(w.id, chatResponse, w.toolCallSent)
-		d, err := json.Marshal(c)
-		if err != nil {
-			return 0, err
-		}
-		if !w.toolCallSent && len(c.Choices) > 0 && len(c.Choices[0].Delta.ToolCalls) > 0 {
-			w.toolCallSent = true
-		}
-
-		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
-		_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
-		if err != nil {
-			return 0, err
-		}
-
-		if chatResponse.Done {
-			if w.streamOptions != nil && w.streamOptions.IncludeUsage {
-				u := toUsage(chatResponse)
-				c.Usage = &u
-				c.Choices = []ChunkChoice{}
-				d, err := json.Marshal(c)
-				if err != nil {
-					return 0, err
-				}
-				_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
-				if err != nil {
-					return 0, err
-				}
-			}
-			_, err = w.ResponseWriter.Write([]byte("data: [DONE]\n\n"))
-			if err != nil {
-				return 0, err
-			}
-		}
-
-		return len(data), nil
-	}
-
-	// chat completion
-	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w.ResponseWriter).Encode(toChatCompletion(w.id, chatResponse))
-	if err != nil {
-		return 0, err
-	}
-
-	return len(data), nil
-}
-
-func (w *ChatWriter) Write(data []byte) (int, error) {
-	code := w.ResponseWriter.Status()
-	if code != http.StatusOK {
-		return w.writeError(data)
-	}
-
-	return w.writeResponse(data)
-}
-
-func (w *CompleteWriter) writeResponse(data []byte) (int, error) {
-	var generateResponse api.GenerateResponse
-	err := json.Unmarshal(data, &generateResponse)
-	if err != nil {
-		return 0, err
-	}
-
-	// completion chunk
-	if w.stream {
-		c := toCompleteChunk(w.id, generateResponse)
-		if w.streamOptions != nil && w.streamOptions.IncludeUsage {
-			c.Usage = &Usage{}
-		}
-		d, err := json.Marshal(c)
-		if err != nil {
-			return 0, err
-		}
-
-		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
-		_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
-		if err != nil {
-			return 0, err
-		}
-
-		if generateResponse.Done {
-			if w.streamOptions != nil && w.streamOptions.IncludeUsage {
-				u := toUsageGenerate(generateResponse)
-				c.Usage = &u
-				c.Choices = []CompleteChunkChoice{}
-				d, err := json.Marshal(c)
-				if err != nil {
-					return 0, err
-				}
-				_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
-				if err != nil {
-					return 0, err
-				}
-			}
-			_, err = w.ResponseWriter.Write([]byte("data: [DONE]\n\n"))
-			if err != nil {
-				return 0, err
-			}
-		}
-
-		return len(data), nil
-	}
-
-	// completion
-	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w.ResponseWriter).Encode(toCompletion(w.id, generateResponse))
-	if err != nil {
-		return 0, err
-	}
-
-	return len(data), nil
-}
-
-func (w *CompleteWriter) Write(data []byte) (int, error) {
-	code := w.ResponseWriter.Status()
-	if code != http.StatusOK {
-		return w.writeError(data)
-	}
-
-	return w.writeResponse(data)
-}
-
-func (w *ListWriter) writeResponse(data []byte) (int, error) {
-	var listResponse api.ListResponse
-	err := json.Unmarshal(data, &listResponse)
-	if err != nil {
-		return 0, err
-	}
-
-	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w.ResponseWriter).Encode(toListCompletion(listResponse))
-	if err != nil {
-		return 0, err
-	}
-
-	return len(data), nil
-}
-
-func (w *ListWriter) Write(data []byte) (int, error) {
-	code := w.ResponseWriter.Status()
-	if code != http.StatusOK {
-		return w.writeError(data)
-	}
-
-	return w.writeResponse(data)
-}
-
-func (w *RetrieveWriter) writeResponse(data []byte) (int, error) {
-	var showResponse api.ShowResponse
-	err := json.Unmarshal(data, &showResponse)
-	if err != nil {
-		return 0, err
-	}
-
-	// retrieve completion
-	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w.ResponseWriter).Encode(toModel(showResponse, w.model))
-	if err != nil {
-		return 0, err
-	}
-
-	return len(data), nil
-}
-
-func (w *RetrieveWriter) Write(data []byte) (int, error) {
-	code := w.ResponseWriter.Status()
-	if code != http.StatusOK {
-		return w.writeError(data)
-	}
-
-	return w.writeResponse(data)
-}
-
-func (w *EmbedWriter) writeResponse(data []byte) (int, error) {
-	var embedResponse api.EmbedResponse
-	err := json.Unmarshal(data, &embedResponse)
-	if err != nil {
-		return 0, err
-	}
-
-	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w.ResponseWriter).Encode(toEmbeddingList(w.model, embedResponse))
-	if err != nil {
-		return 0, err
-	}
-
-	return len(data), nil
-}
-
-func (w *EmbedWriter) Write(data []byte) (int, error) {
-	code := w.ResponseWriter.Status()
-	if code != http.StatusOK {
-		return w.writeError(data)
-	}
-
-	return w.writeResponse(data)
-}
-
-func ListMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		w := &ListWriter{
-			BaseWriter: BaseWriter{ResponseWriter: c.Writer},
-		}
-
-		c.Writer = w
-
-		c.Next()
-	}
-}
-
-func RetrieveMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var b bytes.Buffer
-		if err := json.NewEncoder(&b).Encode(api.ShowRequest{Name: c.Param("model")}); err != nil {
-			c.AbortWithStatusJSON(http.StatusInternalServerError, NewError(http.StatusInternalServerError, err.Error()))
-			return
-		}
-
-		c.Request.Body = io.NopCloser(&b)
-
-		// response writer
-		w := &RetrieveWriter{
-			BaseWriter: BaseWriter{ResponseWriter: c.Writer},
-			model:      c.Param("model"),
-		}
-
-		c.Writer = w
-
-		c.Next()
-	}
-}
-
-func CompletionsMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var req CompletionRequest
-		err := c.ShouldBindJSON(&req)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, NewError(http.StatusBadRequest, err.Error()))
-			return
-		}
-
-		var b bytes.Buffer
-		genReq, err := fromCompleteRequest(req)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, NewError(http.StatusBadRequest, err.Error()))
-			return
-		}
-
-		if err := json.NewEncoder(&b).Encode(genReq); err != nil {
-			c.AbortWithStatusJSON(http.StatusInternalServerError, NewError(http.StatusInternalServerError, err.Error()))
-			return
-		}
-
-		c.Request.Body = io.NopCloser(&b)
-
-		w := &CompleteWriter{
-			BaseWriter:    BaseWriter{ResponseWriter: c.Writer},
-			stream:        req.Stream,
-			id:            fmt.Sprintf("cmpl-%d", rand.Intn(999)),
-			streamOptions: req.StreamOptions,
-		}
-
-		c.Writer = w
-		c.Next()
-	}
-}
-
-func EmbeddingsMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var req EmbedRequest
-		err := c.ShouldBindJSON(&req)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, NewError(http.StatusBadRequest, err.Error()))
-			return
-		}
-
-		if req.Input == "" {
-			req.Input = []string{""}
-		}
-
-		if req.Input == nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, NewError(http.StatusBadRequest, "invalid input"))
-			return
-		}
-
-		if v, ok := req.Input.([]any); ok && len(v) == 0 {
-			c.AbortWithStatusJSON(http.StatusBadRequest, NewError(http.StatusBadRequest, "invalid input"))
-			return
-		}
-
-		var b bytes.Buffer
-		if err := json.NewEncoder(&b).Encode(api.EmbedRequest{Model: req.Model, Input: req.Input}); err != nil {
-			c.AbortWithStatusJSON(http.StatusInternalServerError, NewError(http.StatusInternalServerError, err.Error()))
-			return
-		}
-
-		c.Request.Body = io.NopCloser(&b)
-
-		w := &EmbedWriter{
-			BaseWriter: BaseWriter{ResponseWriter: c.Writer},
-			model:      req.Model,
-		}
-
-		c.Writer = w
-
-		c.Next()
-	}
-}
-
-func ChatMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var req ChatCompletionRequest
-		err := c.ShouldBindJSON(&req)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, NewError(http.StatusBadRequest, err.Error()))
-			return
-		}
-
-		if len(req.Messages) == 0 {
-			c.AbortWithStatusJSON(http.StatusBadRequest, NewError(http.StatusBadRequest, "[] is too short - 'messages'"))
-			return
-		}
-
-		var b bytes.Buffer
-
-		chatReq, err := fromChatRequest(req)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, NewError(http.StatusBadRequest, err.Error()))
-			return
-		}
-
-		if err := json.NewEncoder(&b).Encode(chatReq); err != nil {
-			c.AbortWithStatusJSON(http.StatusInternalServerError, NewError(http.StatusInternalServerError, err.Error()))
-			return
-		}
-
-		c.Request.Body = io.NopCloser(&b)
-
-		w := &ChatWriter{
-			BaseWriter:    BaseWriter{ResponseWriter: c.Writer},
-			stream:        req.Stream,
-			id:            fmt.Sprintf("chatcmpl-%d", rand.Intn(999)),
-			streamOptions: req.StreamOptions,
-		}
-
-		c.Writer = w
-
-		c.Next()
-	}
+	stream := true
+	return &api.ChatRequest{
+		Model: r.Model,
+		Messages: []api.Message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: "What exact words are spoken in this audio?", Images: []api.ImageData{r.AudioData}},
+		},
+		Stream: &stream,
+		Options: map[string]any{
+			"temperature": 0,
+		},
+	}, nil
 }
